@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mky-proxy · 自测</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:24px;background:#121212;color:#e8e8e8;
+       font:15px/1.7 -apple-system,BlinkMacSystemFont,sans-serif}
+  h1{font-size:19px;margin:0 0 6px}
+  p.sub{color:#888;font-size:13px;margin:0 0 18px}
+  label{display:block;font-size:13px;color:#aaa;margin:14px 0 6px}
+  input{width:100%;box-sizing:border-box;padding:10px 12px;font-size:14px;
+        font-family:inherit;color:#eee;background:#1e1e1e;border:1px solid #333;
+        border-radius:8px}
+  input:focus{outline:none;border-color:#e91e63}
+  button{margin-top:18px;padding:11px 22px;font-size:15px;font-family:inherit;
+         color:#fff;background:#e91e63;border:0;border-radius:8px;cursor:pointer}
+  button:disabled{opacity:.5}
+  pre{margin-top:18px;padding:14px;background:#1e1e1e;border-radius:8px;
+      white-space:pre-wrap;word-break:break-all;font-size:13px;max-height:50vh;
+      overflow:auto}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}
+</style>
+</head>
+<body>
+<h1>mky-proxy · 自测</h1>
+<p class="sub">填入密钥和目标地址，看代理能不能转发。</p>
+
+<label>访问密钥</label>
+<input id="key" placeholder="mky_xxxxxxxxxxxx" autocomplete="off">
+
+<label>目标地址</label>
+<input id="target" value="https://music.163.com/api/song/lyric?os=pc&lv=-1&yv=-1&ytv=-1&id=29561031">
+
+<button id="go">开始测试</button>
+<pre id="out">等待测试…</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const out = $('out'), btn = $('go');
+
+// 密钥从 URL 的 ?key= 预填，方便直接点开测
+const preset = new URL(location.href).searchParams.get('key');
+if (preset) $('key').value = preset;
+
+btn.onclick = async () => {
+  const key = $('key').value.trim();
+  const target = $('target').value.trim();
+  if (!key || !target) { out.textContent = '密钥和目标地址都要填'; return; }
+
+  btn.disabled = true;
+  out.textContent = '请求中…';
+  const t0 = performance.now();
+  try {
+    // 注意 URL 编码：目标地址里有 & 和 ?，不编码会把参数拆散
+    const url = '/api?key=' + encodeURIComponent(key) + '&url=' + encodeURIComponent(target);
+    const res = await fetch(url);
+    const text = await res.text();
+    const ms = Math.round(performance.now() - t0);
+
+    let d = null;
+    try { d = JSON.parse(text); } catch (_) {}
+
+    let head;
+    if (res.status === 403) head = '<span class="bad">✗ 密钥不对</span>';
+    else if (!res.ok) head = '<span class="bad">✗ HTTP ' + res.status + '</span>';
+    else head = '<span class="ok">✓ 转发成功</span>';
+
+    out.innerHTML = head + '\n\n'
+      + '耗时:   ' + ms + 'ms\n'
+      + 'HTTP:   ' + res.status + '\n'
+      + '长度:   ' + text.length + ' 字节\n'
+      + (d ? '\nJSON 摘要:\n'
+          + '  code:      ' + d.code + '\n'
+          + '  行级 lrc:  ' + (d.lrc && d.lrc.lyric ? '有' : '无') + '\n'
+          + '  逐字 yrc:  ' + (d.yrc && d.yrc.lyric ? '有' : '无') + '\n'
+          + '  译文 ytlrc: ' + (d.ytlrc && d.ytlrc.lyric ? '有' : '无')
+          : '\n响应片段:\n' + text.slice(0, 300));
+  } catch (e) {
+    out.innerHTML = '<span class="bad">✗ 请求失败</span>\n\n' + e.name + ': ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
