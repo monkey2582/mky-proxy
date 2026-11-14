@@ -2,6 +2,10 @@
  * mky-proxy —— 通用 CORS 代理（Cloudflare Pages Functions）
  *
  * 路由：/api?key=<密钥>&url=<编码后的目标地址>
+ *       &ref=<可选，自定义 Referer>&org=<可选，自定义 Origin>
+ *
+ * 少数接口（如酷我波点歌单）要求同时带对 Referer 与 Origin，
+ * 而浏览器不允许 JS 自行设置这两个头，只能由代理代劳。
  *
  * 分三层省请求：
  *
@@ -23,7 +27,9 @@ const CORS_HEADERS = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': '*',
     // 让前端 JS 也能读到缓存命中标记，方便在 DevTools 里确认缓存是否生效。
-    'Access-Control-Expose-Headers': 'X-Proxy-Cache',
+    // X-Final-Url 是跟随重定向后的最终地址：短链的跳转参数只有服务端能读到，
+    // 浏览器 fetch 跨域拿不到 Location，只能由代理带回来。
+    'Access-Control-Expose-Headers': 'X-Proxy-Cache, X-Final-Url',
     'Access-Control-Max-Age': '86400'
 };
 
@@ -33,6 +39,10 @@ const MAX_BYTES = 12 * 1024 * 1024;
 // 按接口性质给缓存时长（秒）。播放地址有时效（网易云约 20 分钟），
 // 所以走默认的 5 分钟 —— 既省请求，又远早于它过期。
 function ttlFor(u) {
+    // 酷我详情会把“查询失败”也包成 200 + data:null，
+    // 缓存它会让后续重试一直拿到同一份空结果，直接不缓存。
+    if (u.hostname === 'm.kuwo.cn' &&
+        u.pathname.indexOf('songinfoandlrc') >= 0) return 0;
     const type = u.searchParams.get('types');
     if (type === 'pic') return 604800;
     if (type === 'lyric') return 604800;
@@ -98,10 +108,32 @@ export async function onRequest(context) {
         return json({ error: 'protocol not allowed', got: targetUrl.protocol }, 400);
     }
 
+    // 可选的头覆盖：浏览器禁止 JS 设置 Referer/Origin，
+    // 需要防盗链校验的接口只能靠代理转发。只接受 http(s)，挡掉 header 注入。
+    const refParam = params.get('ref') || '';
+    const orgParam = params.get('org') || '';
+    let refHeader = '';
+    let orgHeader = '';
+    try {
+        if (refParam) {
+            const u = new URL(refParam);
+            if (u.protocol === 'http:' || u.protocol === 'https:') refHeader = u.toString();
+        }
+        if (orgParam) {
+            const u = new URL(orgParam);
+            if (u.protocol === 'http:' || u.protocol === 'https:') orgHeader = u.origin;
+        }
+    } catch (_) {
+        return json({ error: 'invalid ref/org' }, 400);
+    }
+
     const ttl = ttlFor(targetUrl);
     // 缓存键用"上游 URL"而不是"代理 URL" —— 这样密钥变了缓存依然有效，
-    // 不同用户请求同一资源也能共享命中。
-    const cacheKey = new Request(targetUrl.toString(), { method: 'GET' });
+    // 不同用户请求同一资源也能共享命中。ref/org 会改变上游返回，必须一起进键。
+    let cacheUrl = targetUrl.toString();
+    if (refHeader) cacheUrl += (cacheUrl.indexOf('?') >= 0 ? '&' : '?') + '__ref=' + encodeURIComponent(refHeader);
+    if (orgHeader) cacheUrl += (cacheUrl.indexOf('?') >= 0 ? '&' : '?') + '__org=' + encodeURIComponent(orgHeader);
+    const cacheKey = new Request(cacheUrl, { method: 'GET' });
     const cache = safeCache();
 
     const hit = cache
@@ -119,12 +151,16 @@ export async function onRequest(context) {
     try {
         upstream = await fetch(targetUrl.toString(), {
             method: 'GET',
-            headers: {
-                'Referer': targetUrl.origin + '/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    + 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    + 'Chrome/120.0.0.0 Safari/537.36'
-            },
+            headers: (function () {
+                const h = {
+                    'Referer': refHeader || (targetUrl.origin + '/'),
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        + 'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        + 'Chrome/120.0.0.0 Safari/537.36'
+                };
+                if (orgHeader) h['Origin'] = orgHeader;
+                return h;
+            })(),
             redirect: 'follow',
             signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
         });
@@ -140,10 +176,13 @@ export async function onRequest(context) {
 
     const headers = new Headers(CORS_HEADERS);
     headers.set('Content-Type', upstream.headers.get('Content-Type') || 'application/octet-stream');
+    // 重定向已跟随，upstream.url 是最终落点。酷狗 t1.kugou.com 这类短链
+    // 把 global_specialid 放在 302 的 Location 里，只能靠这个头交给前端。
+    headers.set('X-Final-Url', upstream.url || targetUrl.toString());
 
     // 只缓存成功的响应。把 4xx/5xx 缓存 5 分钟会让故障"粘住"，
     // 上游一恢复用户却还在看旧错误。
-    const cacheable = upstream.ok;
+    const cacheable = upstream.ok && ttl > 0;
     headers.set('X-Proxy-Cache', cacheable ? 'MISS' : 'BYPASS');
     headers.set('Cache-Control', cacheable
         ? 'public, max-age=' + ttl + ', stale-while-revalidate=' + ttl
