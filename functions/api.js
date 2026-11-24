@@ -3,9 +3,12 @@
  *
  * 路由：/api?key=<密钥>&url=<编码后的目标地址>
  *       &ref=<可选，自定义 Referer>&org=<可选，自定义 Origin>
+ *       &method=<可选，POST>&body=<可选，POST 请求体文本>
  *
  * 少数接口（如酷我波点歌单）要求同时带对 Referer 与 Origin，
  * 而浏览器不允许 JS 自行设置这两个头，只能由代理代劳。
+ * 少数迁移后的接口（如 oiapi /api/Kuwo）改成了 POST + JSON body，
+ * 浏览器直连会被 CORS 拦（上游不返回 Allow-Origin），只能透传 body 转发。
  *
  * 分三层省请求：
  *
@@ -71,8 +74,6 @@ export async function onRequest(context) {
         return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // POST 静默回退成 GET：目标地址完全由 url 参数决定，请求体不参与转发，
-    // 所以方法本身不影响结果。为习惯用 POST 发只读请求的客户端报 405 只是添乱。
     if (req.method !== 'GET' && req.method !== 'POST') {
         return json({ error: 'method not allowed', allow: 'GET, POST, OPTIONS' }, 405);
     }
@@ -127,12 +128,23 @@ export async function onRequest(context) {
         return json({ error: 'invalid ref/org' }, 400);
     }
 
+    // 上游方法与请求体。默认仍按 GET 转发，保持既有调用完全不变；
+    // 只有显式传 method=POST 时才透传 body —— 迁移后的 oiapi 酷我接口需要这个。
+    const upMethod = (params.get('method') || 'GET').toUpperCase();
+    if (upMethod !== 'GET' && upMethod !== 'POST') {
+        return json({ error: 'upstream method not allowed', got: upMethod }, 400);
+    }
+    const upBody = upMethod === 'POST' ? (params.get('body') || '') : '';
+
     const ttl = ttlFor(targetUrl);
     // 缓存键用"上游 URL"而不是"代理 URL" —— 这样密钥变了缓存依然有效，
-    // 不同用户请求同一资源也能共享命中。ref/org 会改变上游返回，必须一起进键。
+    // 不同用户请求同一资源也能共享命中。
+    // ref/org/body 都会改变上游返回，必须一起进键。
     let cacheUrl = targetUrl.toString();
     if (refHeader) cacheUrl += (cacheUrl.indexOf('?') >= 0 ? '&' : '?') + '__ref=' + encodeURIComponent(refHeader);
     if (orgHeader) cacheUrl += (cacheUrl.indexOf('?') >= 0 ? '&' : '?') + '__org=' + encodeURIComponent(orgHeader);
+    if (upBody) cacheUrl += (cacheUrl.indexOf('?') >= 0 ? '&' : '?') + '__body=' + encodeURIComponent(upBody);
+    // POST 一律不读缓存：body 组合近乎无限，命中率极低，且写缓存会污染共享缓存。
     const cacheKey = new Request(cacheUrl, { method: 'GET' });
     const cache = safeCache();
 
@@ -150,7 +162,7 @@ export async function onRequest(context) {
     let upstream;
     try {
         upstream = await fetch(targetUrl.toString(), {
-            method: 'GET',
+            method: upMethod,
             headers: (function () {
                 const h = {
                     'Referer': refHeader || (targetUrl.origin + '/'),
@@ -159,8 +171,10 @@ export async function onRequest(context) {
                         + 'Chrome/120.0.0.0 Safari/537.36'
                 };
                 if (orgHeader) h['Origin'] = orgHeader;
+                if (upMethod === 'POST') h['Content-Type'] = 'application/json';
                 return h;
             })(),
+            body: upMethod === 'POST' ? upBody : undefined,
             redirect: 'follow',
             signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
         });
@@ -182,7 +196,7 @@ export async function onRequest(context) {
 
     // 只缓存成功的响应。把 4xx/5xx 缓存 5 分钟会让故障"粘住"，
     // 上游一恢复用户却还在看旧错误。
-    const cacheable = upstream.ok && ttl > 0;
+    const cacheable = upstream.ok && ttl > 0 && upMethod === 'GET';
     headers.set('X-Proxy-Cache', cacheable ? 'MISS' : 'BYPASS');
     headers.set('Cache-Control', cacheable
         ? 'public, max-age=' + ttl + ', stale-while-revalidate=' + ttl
